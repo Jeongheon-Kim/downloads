@@ -1,0 +1,206 @@
+#!/bin/sh
+#
+### BEGIN INIT INFO
+# Provides: VADA Collector AGENT
+# Required-Start:	
+# Required-Stop:
+# Default-Start:	2 3 4 5
+# Default-Stop:		0 1 6
+# Short-Description: INIT file for VADA Agent Deamon
+### END INIT INFO
+
+# processname: collector_$ARCH
+# config: /opt/vada/agent/vada_agent.conf
+# log: /opt/vada/agent/collector.log
+# pidfile: /var/run/collectord.pid 
+
+VERSION=R230215.9074
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:$PATH
+export PATH
+unset LANG
+
+ARCH=`uname`
+INSTDIR=/opt/vada/agent
+#XXX: malfunction in SKInfoSEC
+#if [ "`echo $INSTDIR | awk '{print substr($0,0,1)}'`" != "/" ]; then # start with /blabla 
+if [ "`echo $INSTDIR | grep '^/'`" = "" ]; then 
+    echo "[ERROR] work_path is not absolute path in vada_agent.conf"
+    echo "Usually work_path is set to /opt/vada/agent."
+    exit 99
+fi
+BIN_PREFIX="collector"
+RETVAL=0
+PROG=""
+
+if [ "$ARCH" = "Linux" ]; then
+	val=`uname -a 2>/dev/null`
+	if [ -n "$val" ]; then
+		if [ "`echo $val | grep "x86_64"`" != "" ]; then
+			PROG="$BIN_PREFIX"_linux
+		elif [ "`echo $val | grep "ppc64le"`" != "" ]; then
+			PROG="$BIN_PREFIX"_linux_ppc64le
+		else
+			PROG="$BIN_PREFIX"_linux_i386
+		fi
+	fi
+elif [ "$ARCH" = "HP-UX" ]; then
+	if [ "`uname -a 2>/dev/null | grep "ia64"`" != "" ]; then
+		PROG="$BIN_PREFIX"_hp-ux_ia64
+	else
+		PROG="$BIN_PREFIX"_hp-ux
+	fi
+elif [ "$ARCH" = "AIX" ]; then
+	PROG="$BIN_PREFIX"_aix
+elif [ "$ARCH" = "SunOS" ]; then
+	uname -a | grep 'sparc' > /dev/null
+	if [ $? -eq 0 ]; then
+		if [ "`uname -a  | grep 5\.9`" != "" ]; then
+			PROG="$BIN_PREFIX"_sunos59
+			#Backward compatibility
+			PROG_NEXT="$BIN_PREFIX"_sunos
+		else
+			PROG="$BIN_PREFIX"_sunos
+		fi
+	else
+		PROG="$BIN_PREFIX"_sunos_x86_64
+	fi
+else
+	boot 1 "[ERR] NO maching arch - $ARCH in init"
+fi
+
+bootlog()
+{
+	if [ $1 -eq 0 ]; then
+		echo "`date +[%y%m%d_%H%M%S]` "$2 > "$INSTDIR/collector.boot"
+	else 
+		echo "`date +[%y%m%d_%H%M%S]` "$2 >> "$INSTDIR/collector.boot"
+	fi
+}
+
+echo_without_newline()
+{
+	printf "$1"
+}
+
+start()
+{
+	bootlog 0 "collector service start" 
+	if [ ! -f $INSTDIR/$PROG ]; then
+		if [ "$PROG_NEXT" = "" ]; then
+			if [ ! -f "$INSTDIR/$PROG.bak" ]; then 
+				bootlog 1 "[ERR] There is no file: $INSTDIR/$PROG or $INSTDIR/$PROG.bak file"
+				return
+			fi
+			cp -f $INSTDIR/$PROG".bak" $INSTDIR/$PROG >/dev/null 2>&1
+			bootlog 1 "Copy agent from bak file"
+			agent_file="$INSTDIR/$PROG"
+		else
+			if [ ! -f "$INSTDIR/$PROG_NEXT" ]; then
+				bootlog 1 "[ERR] There is no file: $INSTDIR/$PROG or $INSTDIR/$PROG_NEXT file"
+				return
+			fi
+			agent_file="$INSTDIR/$PROG_NEXT"
+		fi
+	else
+		agent_file="$INSTDIR/$PROG"
+	fi
+
+	if [ ! -f "$agent_file" ]; then
+		bootlog 1 "[ERR] There is no file: $agent_file file"
+		return 
+	fi
+
+	ps -ef | grep "$agent_file" | grep -v grep > /dev/null
+	if [ $? -eq 0 ]; then
+		bootlog 1 "[ERR] Already is working: $agent_file"
+		echo "[ERR] Already is working: $agent_file"
+		return;
+	fi
+
+	if [ "$INSTDIR/$PROG_NEXT" = "$agent_file" ]; then
+		# collector_sunos  runnning on sunos 5.9
+		if [ "`ps -ef  | grep "$INSTDIR/$PROG" | grep -v grep`" != "" ]; then
+			bootlog 1 "[ERR] Already is working: $agent_file"
+			echo "[ERR] Already is working: $agent_file"
+			return;
+		fi
+	fi
+
+	if [ "$ARCH" = "HP-UX" ]; then
+		$agent_file -c $INSTDIR >/dev/null
+	else
+		nohup $agent_file -c $INSTDIR 1>/dev/null 2>&1 &
+	fi
+
+	sleep 1
+
+	# Create keys if necessary
+	echo_without_newline "Starting $agent_file: "
+	DEAMON_COUNT=`ps -ef  | grep $agent_file | grep -v "grep"  | wc -l`
+
+	if [ "$DEAMON_COUNT" -ge 1 ]; then
+		bootlog 1 "Run it sucessfully"
+		echo "[OK]";
+		return 0;
+	else 
+		bootlog 1 "[ERR] Failed to run it"
+		echo "[FAILED]";
+		return 99;
+	fi
+}
+
+stopped()
+{
+	agent_file=$INSTDIR/$PROG
+	PIDS=`ps -ef | grep $agent_file | grep -v "grep" | awk '{ print $2 }'` 
+	if [ "$PIDS" = "" ] && [ "$PROG_NEXT" != "" ]; then
+		agent_file="$INSTDIR/$PROG_NEXT"
+		PIDS=`ps -ef | grep $agent_file | grep -v "grep" | awk '{ print $2 }'` 
+	fi
+	echo_without_newline "Stopping $PROG: "
+	if [ "$PIDS" = "" ]; then
+		echo "[FAILED]";
+	else 
+		kill -9 $PIDS >/dev/null 2>&1
+		bootlog 1 "Collector is killed pid $PIDS"
+		echo "[OK]";
+	fi
+}
+
+status()
+{
+	agent_file=$INSTDIR/$PROG
+	PIDS=`ps -ef | grep $agent_file | grep -v "grep" | awk '{ print $2 " "}' | tr -d "\n"` 
+	if [ "$PIDS" = "" ] && [ "$PROG_NEXT" != "" ]; then
+		agent_file="$INSTDIR/$PROG_NEXT"
+		PIDS=`ps -ef | grep $agent_file | grep -v "grep" | awk '{ print $2 " "}' | tr -d "\n"` 
+	fi
+	if [ "$PIDS" = "" ]; then
+		echo "$PROG is not running";
+		return 99
+	else
+		echo "$agent_file ( pid: $PIDS) is running" 
+	fi
+	return 0
+}
+
+case "$1" in
+	"start" )
+		start
+		;;
+	"stop" )
+		stopped
+		;;
+	"restart" )
+		stopped
+		start
+		;;
+	"status")
+		status
+		RETVAL=$?
+		;;
+	*)
+		echo $"Usage: $0 {start|stop|restart|status}"
+		RETVAL=1
+esac
+exit $RETVAL

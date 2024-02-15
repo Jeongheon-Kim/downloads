@@ -1,0 +1,17 @@
+[Unit]
+Description=VADA Agent - Collector 
+
+[Service]
+#Type=simple
+Type=forking
+#PIDFile=/run/collector.pid
+ExecStart=/opt/vada/agent/collector start
+ExecStop=/opt/vada/agent/collector stop
+#KillMode=control-group
+KillMode=none
+TimeoutStartSec=0
+RemainAfterExit=yes
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

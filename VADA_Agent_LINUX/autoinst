@@ -1,0 +1,670 @@
+# !/bin/sh
+
+VERSION=R230215.9074
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:$PATH
+export PATH
+LIMIT_SPACE_AGENT=100000 #KB (100MB)
+curr_dir=`pwd`
+
+# Check user is root or not 
+ID=`id | awk '{print $1}'`
+echo "$ID" | grep "uid=0(root)"
+if [ $?  -ne 0 ]; then
+	echo "You must be a root user - Not root" 2>&1
+	exit 99
+fi
+
+UNAME=`uname`
+
+BIN_PREFIX="collector"
+SERVICE_FILE="collector"
+APP=$BIN_PREFIX
+REMOVE_FLAG=0
+
+set_workpath()
+{
+	if [ "$1" != "" ] && [ -f "vada_agent.conf" ]; then
+		conf_file=`cat vada_agent.conf 2>/dev/null | sed -e "s?work_path=.*?work_path=$1?g"`
+		echo "$conf_file" > vada_agent.conf
+	fi
+	INSTDIR=`grep work_path vada_agent.conf | sed s/work_path=//`
+#XXX: malfunction in SKInfoSEC
+#if [ "`echo $INSTDIR | awk '{print substr($0,0,1)}'`" != "/" ]; then
+	if [ "`echo $INSTDIR | grep '^/'`" = "" ]; then 
+		echo "[ERROR] work_path is not absolute path in vada_agent.conf"
+		echo "Usually work_path is set to /opt/vada/agent."
+		exit 99
+	fi
+	CHANGE_SERVICE_FILE=`cat "$SERVICE_FILE" | sed -e 's?^INSTDIR=.*?INSTDIR='"$INSTDIR"'?g'`
+	echo "$CHANGE_SERVICE_FILE" > $SERVICE_FILE
+}
+
+inbound_limit()
+{
+	dirname="$1";
+	if [ -z "$dirname" ]; then
+		return 0; 
+	fi
+	if [ "`command -v df 2>/dev/null`" = "" ]; then
+		return 1;
+	fi
+	while [ ! -d "$dirname" ]; do
+		t=`echo $dirname | awk -F/ '{ORS="/"} {for(i=1;i<NF;i++) { print $i;}}'`
+		if [ "$t" != "/"  ]; then
+			dirname=`echo $t | sed 's/\/$//'`
+		else
+			dirname="$t"
+		fi
+		if [ -z "$dirname" ]; then
+			return 0;
+		fi
+	done
+	df_msg=`df -k "$dirname" 2>/dev/null`
+	avail_kb=0;
+	if [ "$UNAME" = "HP-UX" ]; then
+		#/                      (/dev/vg00/lvol3       ) : 131329344 total allocated Kb
+		#						  109372128 free allocated Kb
+		#						  21957216 used allocated Kb
+		#					          16 % allocation used
+		df_msg=`echo "$df_msg" | grep "free"`
+		avail_kb=`echo "$df_msg" | awk '{print $1}'`
+	else
+		# LINUX
+		# Filesystem                                       1K-blocks     Used Available Use% Mounted on
+		# - dev/mapper/ubuntu--vada--analyzer--dev--vg-root  49946856 22616116  24770536  48% /
+		# SunOS  - SPARC/Solaris
+		# Filesystem            kbytes    used   avail capacity  Mounted on
+		# - /dev/dsk/c1t0d0s0    8495942 6214858 2196125    74%    /
+		# AIX
+		# Filesystem    1024-blocks      Free %Used    Iused %Iused Mounted on
+		# dev/hd10opt     10485760   9934376    6%    12518     1% /opt
+
+		if [ "$UNAME" = "Linux" ]; then
+			# if filesystem name is too long to detect available space
+			df_msg=`echo "$df_msg" | tail -2 | grep -v -i "Avail" | tr "\n" " "`
+		else
+			df_msg=`echo "$df_msg" | tail -1`
+		fi
+
+		if [ "$UNAME" = "Linux" ]; then
+			avail_kb=`echo "$df_msg" | awk '{print $4}'`
+		elif [ "$UNAME" = "SunOS" ]; then
+			avail_kb=`echo "$df_msg" | awk '{print $4}'`
+		elif [ "$UNAME" = "AIX" ]; then
+			avail_kb=`echo "$df_msg" | awk '{print $3}'`
+		fi
+	fi
+
+	if [ "$UNAME" = "Linux" ]; then
+		if [ "$avail_kb" -ge  "$LIMIT_SPACE_AGENT" ]; then
+			return 1;
+		else
+			df -k $1
+			echo "[ERR] current system available ($dirname: $avail_kb KB)  < $LIMIT_SPACE_AGENT KB"
+			return 0;
+		fi
+
+	else
+		return 1;
+	fi
+}
+
+if [ $# -eq 0 ]; then
+	set_workpath
+else
+	if [ "$1" != "--instdir" ] && [ "$1" != "--remove" ]; then
+		echo "XXX: only supported args"
+		echo "     --instdir where to install"
+		echo "     --remove where to delete"
+		exit 99
+	fi
+
+	if [ "$1" = "--remove" ]; then
+		REMOVE_FLAG=1;
+	fi
+	set_workpath "$2"
+fi
+
+if [ $REMOVE_FLAG -eq 0 ]; then
+	inbound_limit "$INSTDIR"
+	if [ "$?" -eq 0 ]; then
+		exit 99
+	fi
+	echo "start to install vada agent..."
+
+else
+	echo "start to delete vada agent..."
+fi
+
+#TARAPP="$PREFIX"
+CONF="vada_agent.conf"
+INIT_DIR="/etc/init.d"
+INIT_RC="/etc/rc.d"
+SBIN_INIT_DIR="/sbin/init.d"
+START_FILE="S99$SERVICE_FILE"
+ORG_CONF_FILE="$INSTDIR/vada_agent.conf"
+VADA_DIR="`dirname $INSTDIR`"
+
+if [ -d "/lib/systemd" ]; then
+	SYSMD_COLLECTOR="/lib/systemd/system/$SERVICE_FILE"
+	SYSMD_DIR="/lib/systemd/system"
+else
+	SYSMD_COLLECTOR="/usr/lib/systemd/system/$SERVICE_FILE"
+	SYSMD_DIR="/usr/lib/systemd/system"
+fi
+
+SYSMD_SERVICE="$SERVICE_FILE.systemd"
+
+if [ "$UNAME" = "Linux" ]; then
+	#RUNLEVEL=`who -r | awk '{print $2}'`
+	# issued from NC 
+	# there is no output as to who -r 
+	RUNLEVEL=3
+else
+	RUNLEVEL=`who -r | awk '{print $3}'`
+	if [ -z "$RUNLEVEL" ]; then
+		echo "[DEF] RUNLEVEL to 2"
+		RUNLEVEL="2"
+	fi
+fi
+chmod 755 ./$SERVICE_FILE 2>/dev/null
+chmod 644 ./$CONF
+chmod 644 ./$SYSMD_SERVICE
+
+chk()
+{
+	if [ "$1" -ne  0 ]; then
+		echo "Failed - $2"
+		exit 99
+	else
+		echo "Success - $2"
+		return 0
+	fi
+}
+
+hide_com()
+{
+	$@ 1>/dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		echo "Failed  - $@"
+		exit 99
+	fi
+}
+
+update_target_name()
+{
+	#TARAPP=$TARAPP"_$1.tar"
+	APP="$BIN_PREFIX"_"$1"
+}
+
+classify_os()
+{
+	if [ "$UNAME" = "Linux" ] ; then 
+		val=`uname -a 2>/dev/null`
+		if [ -n "$val" ]; then
+			if [ "`echo $val | grep "x86_64"`" != "" ]; then
+				update_target_name "linux"
+				echo "64bits for Linux"
+			elif [ "`echo $val | grep "ppc64le"`" != "" ]; then
+				update_target_name "linux_ppc64le"
+			else
+				update_target_name "linux_i386"
+				echo "i386 for Linux"
+			fi
+		else
+			echo "[ERR] Failed to classify cpu type"
+			exit 99
+		fi
+	else 
+		if [ "$UNAME" = "SunOS" ]; then
+			ARCH=`uname -a | grep sparc >/dev/null`	
+			if [ $? -eq 0 ]; then
+				if [ "`uname -a  | grep 5\.9`" != "" ]; then
+					update_target_name "sunos59"
+				else
+					update_target_name "sunos"
+				fi
+			else
+				update_target_name "sunos_x86_64"
+			fi
+		elif [ "$UNAME" = "HP-UX" ]; then
+			if [ "`uname -a 2>/dev/null | grep ia64`" != "" ]; then
+				update_target_name "hp-ux_ia64"
+			else
+				update_target_name "hp-ux"
+			fi
+		elif [ "$UNAME" = "AIX" ]; then
+				update_target_name "aix"
+		else
+			chk 99 "Try to classify OS - No Matching"
+		fi
+	fi
+}
+
+check_runnable()
+{
+	chmod 755 /$INSTDIR/$APP
+	/$INSTDIR/$APP -v 2>/dev/null
+	if [ $? -ne 0 ]; then
+		echo "[ERR] Installed binary is not runnable - $INSTDIR/$APP"
+		exit 99
+	fi
+}
+is_runnable()
+{
+	chmod 755 ./$APP
+	./$APP -v 2>/dev/null
+	if [ $? -ne 0 ]; then
+		echo "[ERR] $APP in current directory is not runnable" 
+		return 99
+	fi
+}
+modify_conf()
+{
+	grep $1 ./$CONF >/dev/null
+	if [ $? -ne 0 ]; then
+		echo "There is no key - '$1'";
+		return;
+	fi
+	sed s/$1=.*$/$1=$2/ ./$CONF > ./$CONF.tmp
+	mv ./$CONF.tmp ./$CONF
+	if [ $? -eq 0 ]; then
+		echo "Replaced '$1=$2' successfully"
+	else
+		echo "Not Replaced '$1=$2'"
+	fi
+}
+
+existed_file()
+{
+	RET=0
+	echo $1
+
+	if [ -f $1 ]; then
+		RET=1
+	else
+		RET=0
+		
+	fi
+	return $RET;
+}
+
+remove()
+{
+	REMOVE_DIR=""
+	if [ -f "$ORG_CONF_FILE" ]; then
+		REMOVE_DIR=`grep "work_path" $ORG_CONF_FILE | awk -F'=' '{ print $2}'`
+	fi
+	if [ "$REMOVE_DIR" = "" ]; then
+		echo "[ERR] Configuration is not existed - $INSTDIR/vada_agent.conf"
+		echo "You have to delete VADA agent manually."
+		return;
+	fi
+	if [ "$REMOVE_DIR" = "/" ]; then
+		echo "[ERR] Don't remove root directory."
+		return;
+	fi
+	echo "$REMOVE_DIR/* Will be removed."
+	#progress
+	#if [ $? -ne 0 ]; then
+	#	return;
+	#fi
+	is_systemd
+	if [ $? -eq 0 ]; then
+		USE_SYSTEMD=1
+	fi
+	echo "Try to Remove VADA agent..."
+#REMOVE SERVICE
+	if [ -n "$USE_SYSTEMD" ]; then 
+		echo ">> systmd"
+		systemctl stop $SERVICE_FILE.service
+		systemctl kill $SERVICE_FILE.service
+		systemctl disable $SERVICE_FILE.service
+		update-rc.d $SERVICE_FILE remove 1>/dev/null 2>&1
+		rm -f $SYSMD_DIR/$SERVICE_FILE.service
+		rm -f $INSTDIR/$SERVICE_FILE
+		# SYSTEMD: OBSOLETE service file.
+		rm -f $INIT_DIR/$SERVICE_FILE
+	else
+		echo ">> initd"
+		case "$UNAME" in 
+			"Linux" )
+				$INIT_DIR/$SERVICE_FILE stop > /dev/null
+				# XXX: installed link file must remove but runlevel is set to 3. 
+				for LEVEL in 3 5 ; do 
+					if [ -d "/etc/rc$LEVEL.d" ]; then
+						rm -f /etc/rc$LEVEL.d/$START_FILE
+					else
+						rm -f $INIT_RC/rc$LEVEL.d/$START_FILE
+					fi
+				done
+				rm -f $INIT_DIR/$SERVICE_FILE
+				;;
+			"AIX" ) 
+				$INIT_RC/rc$RUNLEVEL.d/$START_FILE stop >/dev/null
+				rm -f $INIT_RC/rc$RUNLEVEL.d/$START_FILE
+				;;
+			"SunOS" )
+				/etc/rc$RUNLEVEL.d/$START_FILE stop > /dev/null
+				rm -f /etc/rc$RUNLEVEL.d/$START_FILE
+				;;
+			"HP-UX" )
+				$SBIN_INIT_DIR/$SERVICE_FILE stop >/dev/null
+				rm -f $SBIN_INIT_DIR/$SERVICE_FILE
+				rm -f /sbin/rc$RUNLEVEL.d/$START_FILE
+				;;
+		esac
+	fi
+#REMOVE APP
+	rm -rf $REMOVE_DIR
+	rmdir $VADA_DIR 2>/dev/null
+
+	sync
+	echo "All of processing are done"
+}
+
+chk_initd()
+{
+	case "$UNAME" in
+		"Linux" )
+			existed_file "$INIT_DIR/$SERVICE_FILE"
+			if [ $? -eq 1 ]; then
+				echo "[ERR] Already existed $INIT_DIR/$SERVICE_FILE"
+				return 99;
+			fi
+			existed_file "/etc/rc$RUNLEVEL.d/$START_FILE"
+			if [ $? -eq 1 ]; then
+				echo "[ERR] Already existed /etc/rc$RUNLEVEL.d/$START_FILE"
+				return 99;
+			else
+				existed_file "$INIT_RC/rc$RUNLEVEL.d/$START_FILE"
+				if [ $? -eq 1 ]; then
+				    echo "[ERR] Already existed $INIT_RC/rc$RUNLEVEL.d/$START_FILE"
+					return 99;
+				fi
+			fi
+			;;
+		"SunOS") 
+			existed_file "/etc/rc$RUNLEVEL.d/$START_FILE"
+			if [ $? -eq 1 ]; then
+				echo "[ERR] Already existed /etc/rc$RUNLEVEL.d/$START_FILE"
+				return 99;
+			fi
+			;;
+			
+		"AIX")
+			existed_file "$INIT_RC/rc$RUNLEVEL.d/$START_FILE"
+			if [ $? -eq 1 ]; then
+				echo "[ERR] Already existed $INIT_RC/rc$RUNLEVEL.d/$START_FILE"
+				return 99; 
+			fi
+			;;
+		"HP-UX" ) 
+			#existed_file "$SBIN_INIT_DIR/$START_FILE"
+			#if [ $? -eq 1 ]; then 
+			#	echo "[ERR] Alredy existed $SBIN_INIT_DIR/$SERVICE_FILE"
+			#	return ;
+			#fi
+			existed_file "$SBIN_INIT_DIR/$SERVICE_FILE"
+			if [ $? -eq 1 ]; then
+				echo "[ERR] Alread existed $SBIN_INIT_DIR/$SERVICE_FILE"
+				return  99;
+			fi
+			existed_file "/sbin/rc$RUNLEVEL.d/$START_FILE"
+			if [ $? -eq 1 ]; then
+				echo "[ERR] Already existed /sbin/rc$RUNLEVEL.d/$START_FILE"
+				return  99;
+			fi
+			;;
+		*)
+			echo "[ERR] Don't support $UNAME"
+			return 99;
+			;;
+	esac
+	return 0;
+}
+
+chk_systemd()
+{
+	if [ -f $INIT_DIR/collector ]; then
+		echo "[ERR] Already existed $INIT_DIR/collector"
+		return 99;
+	fi
+
+	if [ -f $SYSMD_DIR/$SERVICE_FILE.service ]; then
+		echo "[ERR] Already existed $SYSMD_DIR/$SERVICE_FILE.service"
+		return  99;
+	fi
+
+	return 0;
+}
+
+is_systemd()
+{
+	if [ "$UNAME" = "Linux" ]; then
+		DEAMON_INIT=`ps -ef | awk '$2 == 1 { print $8 }'`
+		FILE=`which $DEAMON_INIT`
+		ls -l $FILE | grep "systemd" > /dev/null 2>&1
+		return $?
+	else
+		return 99
+	fi
+}
+
+install()
+{
+	# Check current binary is runnable or not 
+	classify_os
+	is_runnable 
+	if [ $? -ne 0 ]; then
+		return 99;
+	fi
+
+# check directory is existed or not - /opt/vada/agent
+	if [ -d "$INSTDIR" ]; then 
+		echo "[ERR] Existed $INSTDIR"
+		return;
+	fi
+
+# check systemd or not
+	is_systemd
+	if [ $? -eq 0 ]; then
+		echo "systemd"
+		USE_SYSTEMD=1
+		which systemctl >/dev/null 2>&1
+		if [ $? -ne 0 ]; then
+			echo "Not found command - systemctl"
+			return
+		fi
+		chk_systemd
+		if [ $? -ne 0 ]; then
+			return 0;
+		fi
+	fi
+
+# check service file is existed or not  - /etc/init.d/collector
+# /etc/rc.d/rc$RUNLEVEL.d/S999colletor
+
+# OS_TYPE: HP-UX
+# /sbin/init.d/collector
+# /sbin/rc$RUNLEVEL.d/S999collector
+	echo "AGENT Name : $APP"
+# Make directory 
+	hide_com "mkdir -p $INSTDIR"
+	chk $? "make directory to $INSTDIR"
+#	hide_com "cp -f ./$TARAPP $INSTDIR"
+# Copy files to install directory
+	hide_com "cp -f ./$CONF $INSTDIR"
+	chk $? "copy $CONF to $INSTDIR"
+	hide_com "cp -f ./$APP $INSTDIR"
+	chk $? "copy $APP $INSTDIR"
+	hide_com "chown root:root $INSTDIR/$APP"
+
+#	cd $INSTDIR
+#	chk $? "Change directory to $INSTDIR"  "cd -"
+#	hide_com "tar -xf ./$TARAPP"
+#	chk $? "Uncompress $TARAPP" "cd -"
+	if [ -n "$USE_SYSTEMD" ]; then
+		#hide_com "cp ./$SERVICE_FILE $INIT_DIR/"
+		#chk $? "copy $SERVICE_FILE to $INIT_DIR"
+		if [ "$INSTDIR" != "/opt/vada/agent" ]; then
+			M_SERVICE_FILE=collector.systemd.modify
+			CHDIR=`echo "$INSTDIR" | sed -e 's/\//\\\\\//g'`
+			sed -e "s/\/opt\/vada\/agent/$CHDIR/g" ./collector.systemd > $M_SERVICE_FILE
+			SYSMD_SERVICE=$M_SERVICE_FILE
+			chomd 644 ./$SYSMD_SERVICE
+		fi
+		hide_com "cp ./$SERVICE_FILE $INSTDIR"
+		chk $? "copy $SERVICE_FILE to $INSTDIR"	
+		hide_com "cp $SYSMD_SERVICE $SYSMD_DIR/collector.service"
+		chk $? "copy $SYSMD_SERVICE to $SYSMD_DIR/collector.service"
+		systemctl enable $SERVICE_FILE.service
+		chk $? "systemctl enable to $SERVICE_FILE.service"
+		systemctl start $SERVICE_FILE.service
+		chk $? "systemctl start $SERVICE_FILE.service"
+	else #initd
+		case "$UNAME" in 
+			"Linux" )
+				hide_com "cp ./$SERVICE_FILE $INIT_DIR/"
+				chk $? "copy $SERVICE_FILE to $INIT_DIR"
+				if [ -d "/etc/rc$RUNLEVEL.d" ]; then
+					hide_com "ln -sf $INIT_DIR/$SERVICE_FILE /etc/rc$RUNLEVEL.d/$START_FILE"
+				else
+					hide_com "ln -sf $INIT_DIR/$SERVICE_FILE $INIT_RC/rc$RUNLEVEL.d/$START_FILE"
+				fi	
+				chk $? "make soft-link to current runlevel"
+				;;
+
+			"SunOS" )
+				#hide_com "cp ./$SERVICE_FILE /etc/init.d/"
+				#chk $? "copy $SERVICE_FILE to $INIT_DIR"
+				#hide_com "ln -sf /etc/init.d/$SERVICE_FILE /etc/rc$RUNLEVEL.d/$START_FILE"
+				hide_com "cp ./$SERVICE_FILE /etc/rc$RUNLEVEL.d/$START_FILE"
+				chk $? "copy $SERVICE_FILE to /etc/rc$RUNLEVEL.d/$START_FILE"
+				;;
+			"AIX" )
+				hide_com "cp ./$SERVICE_FILE $INIT_RC/rc$RUNLEVEL.d/$START_FILE"
+				chk $? "copy $SERVICE_FILE to $INIT_RC/rc$RUNLEVEL.d/$START_FILE"
+				;;
+			"HP-UX" )
+				hide_com "cp ./$SERVICE_FILE $SBIN_INIT_DIR/"
+				chk $? "copy $SERVICE_FILE to $SBIN_INIT_DIR"
+				hide_com "ln -sf $SBIN_INIT_DIR/$SERVICE_FILE /sbin/rc$RUNLEVEL.d/$START_FILE"
+				chk $? "make soft-link to current runlevel"
+				;;
+		esac
+		check_runnable
+		cat $INSTDIR/vada_agent.conf
+
+		hide_com "cd $INSTDIR"
+		chk $? "cd $INSTDIR"
+	#Service start
+		case "$UNAME" in 
+			"Linux" )
+				$INIT_DIR/$SERVICE_FILE start
+				;;
+			"SunOS" )
+				/etc/rc$RUNLEVEL.d/$START_FILE start
+				;;
+			"AIX" )
+				$INIT_RC/rc$RUNLEVEL.d/$START_FILE start
+				;;
+			"HP-UX" )
+				$SBIN_INIT_DIR/$SERVICE_FILE start
+				;;
+		esac
+		hide_com "cd $curr_dir"
+		chk $? "cd $curr_dir"
+	fi
+	cp inst $INSTDIR 2>/dev/null
+	cp autoinst $INSTDIR 2>/dev/null
+	echo "---> All of installation work is done sucessfully"
+}
+
+progress() 
+{
+	while [ 1 ]; 
+	do 
+		if [ "$UNAME" = "Linux" ]; then
+			echo -n "Do you want to continue (y/n)? "
+		else
+			printf "Do you want to continue (y/n)? "
+		fi
+		read QUERY
+		if [ "$QUERY" = "y" ]; then 
+			return 0
+		elif [ "$QUERY" = "n" ]; then 
+			return 99 
+		fi
+	done
+}
+
+is_valid_ip()
+{
+	if expr "$1" : '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$' >/dev/null; then
+		for i in 1 2 3 4; do 
+			val=`echo "$1" | cut -d. -f$i`
+			if [ "$val" -gt  255 ]; then
+				return 99;
+			fi
+		done
+		if [ "$1" = "255.255.255.255" -o "$1" = "0.0.0.0" ]; then
+			return 99
+		fi
+	else
+		return 99
+	fi
+	return 0
+}
+
+is_valid_port()
+{
+
+	if [ "$1" -gt 0 -a "$1" -le 65535 ]; then
+		return 0;
+	else
+		return 1
+	fi
+}
+
+update_target_ip()
+{
+	if [ "$UNAME" = "Linux" ]; then
+		# detour  UGH
+		intf=`route -n | grep "UG " | awk '{print $NF}' | head -1`
+		if [ ! -z "$intf" ]; then
+			TARGET_IP=`ip address show dev "$intf" | grep "scope global" | grep "inet " | awk '{print $2}' | awk -F/ '{printf $1}'`
+		fi
+		if [ -z "$TARGET_IP" ]; then
+			for intf in `ifconfig -a | grep encap:Ethernet | awk '{print $1}'`; do
+				  IP=`ip address show dev "$intf" | grep "scope global" | grep "inet " | awk '{print $2}' | awk -F/ '{printf $1}'`
+				  if [ ! -z "$IP" ]; then
+					  TARGET_IP="$IP"
+					  break;
+				  fi 
+			done
+		fi
+	elif [ "$UNAME" = "SunOS" ]; then
+		TARGET_IP=`ifconfig -a | grep "inet "  | grep -v "127.0.0.1" | grep "broadcast" | head -n 1 | awk '{print $2}'`
+	elif [ "$UNAME" = "HP-UX" ]; then
+		TARGET_IP=`netstat -in | grep -v 127.0.0.1 | tail -n 1 | awk '{print $4}'`
+	elif [ "$UNAME" = "AIX" ]; then
+		TARGET_IP=`ifconfig -a | grep "inet "  | grep -v "127.0.0.1" | grep "broad" | head -n 1 | awk '{print $2}'`
+	else
+		chk 99 "Try to classify OS - No Matching"
+	fi
+
+	if [ ! -z "$TARGET_IP" ]; then
+		modify_conf "target_ip" "$TARGET_IP";
+	fi
+}
+
+remove
+if [ $REMOVE_FLAG -eq 1 ]; then
+	exit 0
+fi
+update_target_ip
+if [ $? -eq 0 ]; then
+	echo "Try to Install VADA Agent..."
+	install
+fi 
